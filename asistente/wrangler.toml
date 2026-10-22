@@ -1,0 +1,10 @@
+name = "asistente-contabilidad-tcm"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+[vars]
+GITHUB_REPO = "TCMP-MRoncancio/Repositorio-de-conocimiento--Contabilidad"
+GITHUB_BRANCH = "main"
+MODELO = "claude-haiku-5-5"
+# Secretos (no van en este archivo): ANTHROPIC_API_KEY, GITHUB_TOKEN, CLAVE_ACCESO
+# Se cargan con: npx wrangler secret put ANTHROPIC_API_KEY
