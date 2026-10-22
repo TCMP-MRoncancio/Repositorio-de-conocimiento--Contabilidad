@@ -1,9 +1,14 @@
-// Asistente de Contabilidad TCM
+﻿// Asistente de Contabilidad TCM
 // Cloudflare Worker que sirve la página de preguntas y una API que consulta a Claude
 // usando como única fuente el banco de conocimiento del repositorio de GitHub.
 //
 // Variables (Cloudflare → Worker → Settings → Variables and Secrets):
-//   ANTHROPIC_API_KEY  (secreto, obligatorio)  clave de la API de Claude
+// Motor de respuestas (uno de los dos):
+//   - Gratis: binding de Workers AI con nombre AI (Settings → Bindings → Add → Workers AI). No requiere clave.
+//   - Claude: variable secreta ANTHROPIC_API_KEY. Si está definida, se usa Claude en lugar de Workers AI.
+//
+//   ANTHROPIC_API_KEY  (secreto, opcional)     clave de la API de Claude
+//   MODELO_CF          (texto, opcional)       modelo de Workers AI, por defecto "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 //   GITHUB_REPO        (texto, obligatorio)    p. ej. TCMP-MRoncancio/Repositorio-de-conocimiento--Contabilidad
 //   GITHUB_BRANCH      (texto, opcional)       por defecto "main"
 //   GITHUB_TOKEN       (secreto, opcional)     solo si el repositorio es privado (token de solo lectura)
@@ -11,6 +16,7 @@
 //   MODELO             (texto, opcional)       por defecto "claude-haiku-5-5"
 
 const MODELO_POR_DEFECTO = "claude-haiku-5-5";
+const MODELO_CF_POR_DEFECTO = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const MINUTOS_CACHE = 10;
 const MAX_TURNOS = 12;
 const MAX_CARACTERES = 4000;
@@ -26,7 +32,8 @@ export default {
       }
       if (request.method === "GET" && url.pathname === "/api/estado") {
         const kb = await cargarConocimiento(env);
-        return json({ ok: true, archivos: kb.archivos, requiereClave: Boolean(env.CLAVE_ACCESO) });
+        const motor = env.ANTHROPIC_API_KEY ? "Claude" : (env.AI ? "Workers AI (gratis)" : "sin configurar");
+        return json({ ok: true, motor, archivos: kb.archivos, requiereClave: Boolean(env.CLAVE_ACCESO) });
       }
       if (request.method === "POST" && url.pathname === "/api/preguntar") {
         return await preguntar(request, env);
@@ -39,7 +46,10 @@ export default {
 };
 
 async function preguntar(request, env) {
-  if (!env.ANTHROPIC_API_KEY) return json({ error: "Falta configurar ANTHROPIC_API_KEY en el Worker." }, 500);
+  const usarClaude = Boolean(env.ANTHROPIC_API_KEY);
+  if (!usarClaude && !env.AI) {
+    return json({ error: "Falta configurar el motor: agrega el binding de Workers AI con nombre AI (gratis) o la variable ANTHROPIC_API_KEY." }, 500);
+  }
 
   if (env.CLAVE_ACCESO && request.headers.get("x-clave") !== env.CLAVE_ACCESO) {
     return json({ error: "Clave de acceso incorrecta.", codigo: "clave" }, 401);
@@ -57,6 +67,8 @@ async function preguntar(request, env) {
   if (typeof mensajes === "string") return json({ error: mensajes }, 400);
 
   const kb = await cargarConocimiento(env);
+
+  if (!usarClaude) return await preguntarWorkersAI(env, kb, mensajes);
 
   const respuesta = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -84,6 +96,30 @@ async function preguntar(request, env) {
   }
   const texto = (datos.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
   return json({ respuesta: texto || "No se recibió respuesta.", modelo: datos.model });
+}
+
+// Motor gratuito: Workers AI de Cloudflare (sin clave, 10.000 neuronas diarias en el plan Free).
+// En el plan Workers Free, al agotar la cuota diaria simplemente deja de responder hasta el día siguiente: nunca cobra.
+async function preguntarWorkersAI(env, kb, mensajes) {
+  const modelo = (env.MODELO_CF || MODELO_CF_POR_DEFECTO).trim();
+  let resultado;
+  try {
+    resultado = await env.AI.run(modelo, {
+      messages: [{ role: "system", content: kb.sistema.instrucciones + "\n\n" + kb.sistema.conocimiento }].concat(mensajes),
+      max_tokens: 1200,
+      temperature: 0.2,
+    });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/4006|daily free allocation|neurons/i.test(msg)) {
+      return json({ error: "Se alcanzó el límite gratuito de preguntas de hoy. El asistente vuelve a estar disponible mañana." }, 429);
+    }
+    return json({ error: "El motor gratuito no pudo responder: " + msg }, 502);
+  }
+  let texto = "";
+  if (resultado && typeof resultado.response === "string") texto = resultado.response;
+  else if (resultado && resultado.choices && resultado.choices[0]) texto = (resultado.choices[0].message && resultado.choices[0].message.content) || "";
+  return json({ respuesta: (texto || "No se recibió respuesta.").trim(), modelo: modelo });
 }
 
 function validarMensajes(m) {
